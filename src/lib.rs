@@ -24,6 +24,7 @@
 )]
 
 pub mod config;
+pub mod mtu;
 pub mod icmp;
 pub mod packet;
 pub mod packet_session;

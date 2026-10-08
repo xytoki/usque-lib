@@ -27,6 +27,7 @@
 
 mod config;
 mod icmp;
+mod mtu;
 mod packet;
 mod register;
 mod tls;

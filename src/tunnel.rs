@@ -8,11 +8,11 @@ use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::icmp;
+use crate::mtu::max_datagram_size;
 use crate::packet;
 use crate::tls;
 use crate::udp_socket::bind_udp_socket;
 
-const MAX_DATAGRAM_SIZE: usize = 1350;
 
 /// Configuration for a MASQUE tunnel session.
 pub struct TunnelConfig {
@@ -154,8 +154,8 @@ where
         .map_err(|e| anyhow::anyhow!("load key: {e}"))?;
 
     quic_config.set_max_idle_timeout(0);
-    quic_config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
-    quic_config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
+    quic_config.set_max_recv_udp_payload_size(max_datagram_size(tunnel_cfg.mtu));
+    quic_config.set_max_send_udp_payload_size(max_datagram_size(tunnel_cfg.mtu));
     quic_config.set_initial_max_data(10_000_000);
     quic_config.set_initial_max_stream_data_bidi_local(1_000_000);
     quic_config.set_initial_max_stream_data_bidi_remote(1_000_000);
@@ -189,7 +189,7 @@ where
     )
     .map_err(|e| anyhow::anyhow!("quiche connect: {e}"))?;
 
-    let mut out = vec![0u8; MAX_DATAGRAM_SIZE];
+    let mut out = vec![0u8; max_datagram_size(tunnel_cfg.mtu)];
     let mut buf = vec![0u8; 65535];
 
     let (write, send_info) = conn

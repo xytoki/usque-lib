@@ -14,11 +14,11 @@ use std::time::Duration;
 use tokio::time::{Instant, Sleep};
 
 use crate::config::Config;
+use crate::mtu::max_datagram_size;
 use crate::packet;
 use crate::tls;
 use crate::udp_socket::bind_udp_socket;
 
-const MAX_DATAGRAM_SIZE: usize = 1350;
 const DEFAULT_QUEUE_CAPACITY: usize = 32768;
 
 #[derive(Debug, Clone)]
@@ -80,7 +80,7 @@ struct PendingUdpSend {
 impl MasquePacketStream {
     pub async fn connect(config: Arc<Config>, session_cfg: PacketSessionConfig) -> Result<Self> {
         let tls_material = tls::prepare_tls_material(config.as_ref())?;
-        let mut quic_config = build_quic_config(&tls_material)?;
+        let mut quic_config = build_quic_config(&tls_material, session_cfg.mtu)?;
 
         let bind_addr: SocketAddr =
             session_cfg
@@ -108,7 +108,7 @@ impl MasquePacketStream {
             &mut quic_config,
         )?;
 
-        let mut out = vec![0u8; MAX_DATAGRAM_SIZE];
+        let mut out = vec![0u8; max_datagram_size(session_cfg.mtu)];
         let mut buf = vec![0u8; 65535];
 
         flush_conn_send(&socket, &mut conn, &mut out).await?;
@@ -549,7 +549,7 @@ impl Sink<Bytes> for MasquePacketStream {
     }
 }
 
-fn build_quic_config(tls_material: &tls::TlsMaterial) -> Result<quiche::Config> {
+fn build_quic_config(tls_material: &tls::TlsMaterial, mtu: u32) -> Result<quiche::Config> {
     let mut quic_config = quiche::Config::new(quiche::PROTOCOL_VERSION)
         .map_err(|e| anyhow::anyhow!("quiche config: {e}"))?;
 
@@ -565,8 +565,8 @@ fn build_quic_config(tls_material: &tls::TlsMaterial) -> Result<quiche::Config> 
         .map_err(|e| anyhow::anyhow!("load key: {e}"))?;
 
     quic_config.set_max_idle_timeout(0);
-    quic_config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
-    quic_config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
+    quic_config.set_max_recv_udp_payload_size(max_datagram_size(mtu));
+    quic_config.set_max_send_udp_payload_size(max_datagram_size(mtu));
     quic_config.set_initial_max_data(10_000_000);
     quic_config.set_initial_max_stream_data_bidi_local(1_000_000);
     quic_config.set_initial_max_stream_data_bidi_remote(1_000_000);
