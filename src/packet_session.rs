@@ -14,12 +14,14 @@ use std::time::Duration;
 use tokio::time::{Instant, Sleep};
 
 use crate::config::Config;
+use crate::icmp;
 use crate::mtu::max_datagram_size;
 use crate::packet;
 use crate::tls;
 use crate::udp_socket::bind_udp_socket;
 
-const DEFAULT_QUEUE_CAPACITY: usize = 32768;
+const DEFAULT_QUEUE_CAPACITY: usize = 4096;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub struct PacketSessionConfig {
@@ -57,16 +59,19 @@ pub struct MasquePacketStream {
     socket: tokio::net::UdpSocket,
     conn: quiche::Connection,
     h3_conn: quiche::h3::Connection,
+    connect_stream_id: u64,
+    flow_id: u64,
     flow_prefix: Vec<u8>,
+    mtu: u16,
     outbound_queue: VecDeque<Bytes>,
     inbound_queue: VecDeque<Bytes>,
     out: Vec<u8>,
     buf: Vec<u8>,
     local_addr: SocketAddr,
     endpoint: SocketAddr,
-    keepalive_period: Duration,
     state: PacketSessionState,
     timeout: Pin<Box<Sleep>>,
+    has_timeout: bool,
     pending_send: Option<PendingUdpSend>,
     terminal_error: Option<String>,
     emitted_terminal_error: bool,
@@ -111,76 +116,87 @@ impl MasquePacketStream {
         let mut out = vec![0u8; max_datagram_size(session_cfg.mtu)];
         let mut buf = vec![0u8; 65535];
 
-        flush_conn_send(&socket, &mut conn, &mut out).await?;
+        let (h3_conn, stream_id, flow_id) = tokio::time::timeout(CONNECT_TIMEOUT, async {
+            flush_conn_send(&socket, &mut conn, &mut out).await?;
 
-        if let Some(outcome) = complete_handshake(
-            &socket,
-            &mut conn,
-            &mut out,
-            &mut buf,
-            local_addr,
-            session_cfg.endpoint,
-        )
-        .await
-        {
-            return Err(anyhow::anyhow!(outcome.into_message()));
-        }
-
-        if let Some(peer_cert) = conn.peer_cert() {
-            if !tls::verify_endpoint_key(peer_cert, &tls_material.endpoint_pub_key_spki_der) {
-                bail!("peer certificate public key does not match pinned endpoint key");
+            if let Some(outcome) = complete_handshake(
+                &socket,
+                &mut conn,
+                &mut out,
+                &mut buf,
+                local_addr,
+                session_cfg.endpoint,
+            )
+            .await
+            {
+                return Err(anyhow::anyhow!(outcome.into_message()));
             }
-        }
 
-        let mut h3_config = quiche::h3::Config::new()?;
-        h3_config.enable_extended_connect(true);
+            if let Some(peer_cert) = conn.peer_cert() {
+                if !tls::verify_endpoint_key(peer_cert, &tls_material.endpoint_pub_key_spki_der) {
+                    bail!("peer certificate public key does not match pinned endpoint key");
+                }
+            }
 
-        let mut h3_conn = quiche::h3::Connection::with_transport(&mut conn, &h3_config)?;
+            let mut h3_config = quiche::h3::Config::new()?;
+            h3_config.enable_extended_connect(true);
 
-        let req = vec![
-            quiche::h3::Header::new(b":method", b"CONNECT"),
-            quiche::h3::Header::new(b":protocol", b"cf-connect-ip"),
-            quiche::h3::Header::new(b":scheme", b"https"),
-            quiche::h3::Header::new(b":authority", b"cloudflareaccess.com"),
-            quiche::h3::Header::new(b":path", b"/"),
-            quiche::h3::Header::new(b"capsule-protocol", b"?1"),
-            quiche::h3::Header::new(b"user-agent", b""),
-        ];
+            let mut h3_conn = quiche::h3::Connection::with_transport(&mut conn, &h3_config)?;
 
-        let stream_id = h3_conn.send_request(&mut conn, &req, false)?;
-        let flow_id = stream_id / 4;
+            let req = vec![
+                quiche::h3::Header::new(b":method", b"CONNECT"),
+                quiche::h3::Header::new(b":protocol", b"cf-connect-ip"),
+                quiche::h3::Header::new(b":scheme", b"https"),
+                quiche::h3::Header::new(b":authority", b"cloudflareaccess.com"),
+                quiche::h3::Header::new(b":path", b"/"),
+                quiche::h3::Header::new(b"capsule-protocol", b"?1"),
+                quiche::h3::Header::new(b"user-agent", b""),
+            ];
 
-        flush_conn_send(&socket, &mut conn, &mut out).await?;
+            let stream_id = h3_conn.send_request(&mut conn, &req, false)?;
+            let flow_id = stream_id / 4;
 
-        if let Some(outcome) = wait_for_connect_response(
-            &socket,
-            &mut conn,
-            &mut h3_conn,
-            &mut out,
-            &mut buf,
-            local_addr,
-            session_cfg.endpoint,
-            stream_id,
-        )
+            flush_conn_send(&socket, &mut conn, &mut out).await?;
+
+            if let Some(outcome) = wait_for_connect_response(
+                &socket,
+                &mut conn,
+                &mut h3_conn,
+                &mut out,
+                &mut buf,
+                local_addr,
+                session_cfg.endpoint,
+                stream_id,
+            )
+            .await
+            {
+                return Err(anyhow::anyhow!(outcome.into_message()));
+            }
+
+            Ok::<_, anyhow::Error>((h3_conn, stream_id, flow_id))
+        })
         .await
-        {
-            return Err(anyhow::anyhow!(outcome.into_message()));
-        }
+        .map_err(|_| {
+            anyhow::anyhow!("MASQUE connect timed out after {}s", CONNECT_TIMEOUT.as_secs())
+        })??;
 
         let mut stream = Self {
             socket,
             conn,
             h3_conn,
+            connect_stream_id: stream_id,
+            flow_id,
             flow_prefix: build_flow_prefix(flow_id),
+            mtu: session_cfg.mtu.min(u32::from(u16::MAX)) as u16,
             outbound_queue: VecDeque::new(),
             inbound_queue: VecDeque::new(),
             out,
             buf,
             local_addr,
             endpoint: session_cfg.endpoint,
-            keepalive_period: session_cfg.keepalive_period,
             state: PacketSessionState::Ready,
             timeout: Box::pin(tokio::time::sleep(Duration::from_millis(0))),
+            has_timeout: false,
             pending_send: None,
             terminal_error: None,
             emitted_terminal_error: false,
@@ -198,15 +214,15 @@ impl MasquePacketStream {
     }
 
     fn reset_timeout(&mut self) {
-        let deadline = Instant::now() + self.current_timeout();
-        self.timeout.as_mut().reset(deadline);
-    }
-
-    fn current_timeout(&self) -> Duration {
-        self.conn
-            .timeout()
-            .unwrap_or(self.keepalive_period)
-            .min(self.keepalive_period)
+        match self.conn.timeout() {
+            Some(duration) => {
+                self.timeout.as_mut().reset(Instant::now() + duration);
+                self.has_timeout = true;
+            }
+            None => {
+                self.has_timeout = false;
+            }
+        }
     }
 
     fn set_terminal_error(&mut self, error: impl Into<String>) {
@@ -234,8 +250,13 @@ impl MasquePacketStream {
         loop {
             let mut made_progress = false;
 
-            made_progress |=
-                flush_pending_queue(&mut self.conn, &self.flow_prefix, &mut self.outbound_queue);
+            made_progress |= flush_pending_queue(
+                &mut self.conn,
+                &self.flow_prefix,
+                self.mtu,
+                &mut self.outbound_queue,
+                &mut self.inbound_queue,
+            );
             match self.poll_flush_conn_send(cx) {
                 Poll::Ready(Ok(flushed)) => made_progress |= flushed,
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
@@ -251,7 +272,7 @@ impl MasquePacketStream {
             made_progress |= self.poll_h3_events()?;
             made_progress |= self.poll_incoming_datagrams()?;
 
-            if self.timeout.as_mut().poll(cx).is_ready() {
+            if self.has_timeout && self.timeout.as_mut().poll(cx).is_ready() {
                 self.conn.on_timeout();
                 self.reset_timeout();
                 made_progress = true;
@@ -320,18 +341,6 @@ impl MasquePacketStream {
 
         loop {
             if self.pending_send.is_none() {
-                match self.socket.poll_send_ready(cx) {
-                    Poll::Ready(Ok(())) => {}
-                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                    Poll::Pending => {
-                        return if flushed {
-                            Poll::Ready(Ok(true))
-                        } else {
-                            Poll::Pending
-                        };
-                    }
-                }
-
                 let (write, send_info) = match self.conn.send(&mut self.out) {
                     Ok(result) => result,
                     Err(quiche::Error::Done) => return Poll::Ready(Ok(flushed)),
@@ -343,6 +352,18 @@ impl MasquePacketStream {
                     to: send_info.to,
                 });
                 self.reset_timeout();
+            }
+
+            match self.socket.poll_send_ready(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => {
+                    return if flushed {
+                        Poll::Ready(Ok(true))
+                    } else {
+                        Poll::Pending
+                    };
+                }
             }
 
             let pending = self.pending_send.as_ref().unwrap();
@@ -365,11 +386,8 @@ impl MasquePacketStream {
                     )));
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    return if flushed {
-                        Poll::Ready(Ok(true))
-                    } else {
-                        Poll::Pending
-                    };
+                    // try_send 返回 WouldBlock 后回到循环顶部，由 poll_send_ready 注册写唤醒。
+                    continue;
                 }
                 Err(error) => return Poll::Ready(Err(error)),
             }
@@ -381,10 +399,42 @@ impl MasquePacketStream {
 
         loop {
             match self.h3_conn.poll(&mut self.conn) {
-                Ok(_) => progressed = true,
+                Ok((stream_id, event)) => {
+                    progressed = true;
+                    self.handle_h3_event(stream_id, &event)?;
+                }
                 Err(quiche::h3::Error::Done) => return Ok(progressed),
                 Err(error) => return Err(io::Error::other(format!("h3 poll error: {error}"))),
             }
+        }
+    }
+
+    /// CONNECT 流的事件处置。流被对端关闭或 reset 就是隧道终结：
+    /// 数据报是连接级的，流死了发送照样成功、包却全部石沉大海，
+    /// 所以必须盯住事件。Data 事件把 capsule 读掉，免得占着流的
+    /// 接收窗口。
+    fn handle_h3_event(&mut self, stream_id: u64, event: &quiche::h3::Event) -> io::Result<()> {
+        if stream_id != self.connect_stream_id {
+            return Ok(());
+        }
+        match event {
+            quiche::h3::Event::Finished => Err(io::Error::other("MASQUE CONNECT flow closed")),
+            quiche::h3::Event::Reset(code) => Err(io::Error::other(format!(
+                "MASQUE CONNECT flow reset (code {code})"
+            ))),
+            quiche::h3::Event::Data => loop {
+                match self
+                    .h3_conn
+                    .recv_body(&mut self.conn, stream_id, &mut self.buf)
+                {
+                    Ok(_) => {}
+                    Err(quiche::h3::Error::Done) => return Ok(()),
+                    Err(error) => {
+                        return Err(io::Error::other(format!("h3 recv_body error: {error}")))
+                    }
+                }
+            },
+            _ => Ok(()),
         }
     }
 
@@ -399,7 +449,7 @@ impl MasquePacketStream {
             match self.conn.dgram_recv_vec() {
                 Ok(dgram) => {
                     progressed = true;
-                    if let Some(offset) = parse_datagram_offset(&dgram, 0) {
+                    if let Some(offset) = parse_datagram_offset(&dgram, self.flow_id) {
                         let dgram = Bytes::from(dgram);
                         let packet = dgram.slice(offset..);
                         if packet::validate_incoming(packet.as_ref()).is_ok() {
@@ -505,15 +555,8 @@ impl Sink<Bytes> for MasquePacketStream {
             let queue_before = self.outbound_queue.len();
             match self.poll_drive(cx) {
                 Poll::Ready(Ok(())) => {
-                    if self.outbound_queue.is_empty() {
-                        match self.poll_flush_conn_send(cx) {
-                            Poll::Ready(Ok(_)) => return Poll::Ready(Ok(())),
-                            Poll::Ready(Err(error)) => {
-                                self.set_terminal_error(error.to_string());
-                                return Poll::Ready(Err(error));
-                            }
-                            Poll::Pending => return Poll::Pending,
-                        }
+                    if self.outbound_queue.is_empty() && self.pending_send.is_none() {
+                        return Poll::Ready(Ok(()));
                     }
 
                     if self.outbound_queue.len() == queue_before {
@@ -524,7 +567,12 @@ impl Sink<Bytes> for MasquePacketStream {
                     self.set_terminal_error(error.to_string());
                     return Poll::Ready(Err(error));
                 }
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    if self.outbound_queue.is_empty() && self.pending_send.is_none() {
+                        return Poll::Ready(Ok(()));
+                    }
+                    return Poll::Pending;
+                }
             }
         }
     }
@@ -564,7 +612,10 @@ fn build_quic_config(tls_material: &tls::TlsMaterial, mtu: u32) -> Result<quiche
         .load_priv_key_from_pem_file(tls_material.key_pem_file.path().to_str().unwrap())
         .map_err(|e| anyhow::anyhow!("load key: {e}"))?;
 
-    quic_config.set_max_idle_timeout(0);
+    // 空闲 60 秒即关闭，与 quic-go 的默认一致。两边都设 0 的话这个
+    // 超时会被完全禁用，连接死了也察觉不到。正常流量会不断重置
+    // 计时器；空闲的链路到点断开，等下次有包再重连。
+    quic_config.set_max_idle_timeout(60_000);
     quic_config.set_max_recv_udp_payload_size(max_datagram_size(mtu));
     quic_config.set_max_send_udp_payload_size(max_datagram_size(mtu));
     quic_config.set_initial_max_data(10_000_000);
@@ -719,11 +770,17 @@ async fn flush_conn_send(
 fn flush_pending_queue(
     conn: &mut quiche::Connection,
     flow_prefix: &[u8],
+    mtu: u16,
     queue: &mut VecDeque<Bytes>,
+    inbound_queue: &mut VecDeque<Bytes>,
 ) -> bool {
     let mut progressed = false;
 
-    while let Some(packet) = queue.front().cloned() {
+    while let Some(packet) = queue.front() {
+        if conn.is_dgram_send_queue_full() {
+            break;
+        }
+
         match build_flow_datagram(flow_prefix, packet) {
             Some(dgram) => match conn.dgram_send_vec(dgram) {
                 Ok(()) | Err(quiche::Error::InvalidState) => {
@@ -734,9 +791,24 @@ fn flush_pending_queue(
                     break;
                 }
                 Err(error) => {
-                    let _ = queue.pop_front();
+                    let Some(packet) = queue.pop_front() else {
+                        break;
+                    };
                     progressed = true;
-                    log::debug!("datagram send error: {error}");
+                    let effective_mtu = effective_inner_mtu(
+                        conn.dgram_max_writable_len(),
+                        flow_prefix.len(),
+                        mtu,
+                    );
+                    log::debug!(
+                        "datagram send error: {error}, generating ICMP Packet Too Big (mtu={effective_mtu})"
+                    );
+                    if inbound_queue.len() < DEFAULT_QUEUE_CAPACITY {
+                        if let Some(icmp_pkt) = icmp::compose_icmp_too_large(&packet, effective_mtu)
+                        {
+                            inbound_queue.push_back(Bytes::from(icmp_pkt));
+                        }
+                    }
                 }
             },
             None => {
@@ -750,10 +822,22 @@ fn flush_pending_queue(
     progressed
 }
 
-fn build_flow_datagram(flow_prefix: &[u8], packet: Bytes) -> Option<Vec<u8>> {
+fn effective_inner_mtu(
+    dgram_max_writable: Option<usize>,
+    flow_prefix_len: usize,
+    configured_mtu: u16,
+) -> u16 {
+    dgram_max_writable
+        .and_then(|max_len| max_len.checked_sub(flow_prefix_len))
+        .and_then(|inner_mtu| u16::try_from(inner_mtu).ok())
+        .filter(|&inner_mtu| inner_mtu > 0)
+        .map_or(configured_mtu, |inner_mtu| inner_mtu.min(configured_mtu))
+}
+
+fn build_flow_datagram(flow_prefix: &[u8], packet: &[u8]) -> Option<Vec<u8>> {
     let mut dgram = Vec::with_capacity(flow_prefix.len() + packet.len());
     dgram.extend_from_slice(flow_prefix);
-    dgram.extend_from_slice(&packet);
+    dgram.extend_from_slice(packet);
     if packet::prepare_outgoing(&mut dgram[flow_prefix.len()..]).is_ok() {
         Some(dgram)
     } else {
@@ -822,7 +906,15 @@ mod tests {
             0x45, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 64, 0x11, 0x00, 0x00, 10, 0, 0, 1, 10,
             0, 0, 2,
         ]);
-        let datagram = build_flow_datagram(&flow_prefix, packet).unwrap();
+        let datagram = build_flow_datagram(&flow_prefix, &packet).unwrap();
         assert_eq!(datagram[flow_prefix.len() + 8], 63);
+    }
+
+    #[test]
+    fn effective_inner_mtu_clamps_to_writable_datagram_budget() {
+        assert_eq!(effective_inner_mtu(Some(1250), 2, 1340), 1248);
+        assert_eq!(effective_inner_mtu(Some(1344), 2, 1340), 1340);
+        assert_eq!(effective_inner_mtu(Some(2), 2, 1340), 1340);
+        assert_eq!(effective_inner_mtu(None, 2, 1340), 1340);
     }
 }

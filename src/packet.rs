@@ -94,6 +94,21 @@ pub fn validate_incoming(buf: &[u8]) -> Result<u8, PacketError> {
 /// The header slice must be exactly 20 bytes (no options) or at least
 /// the IHL-indicated length. We compute over the full IHL length.
 fn calculate_ipv4_checksum(header: &[u8]) -> u16 {
+    if header.len() >= IPV4_HEADER_LEN && (header[0] & 0x0F) == 5 {
+        let sum = u32::from(u16::from_be_bytes([header[0], header[1]]))
+            + u32::from(u16::from_be_bytes([header[2], header[3]]))
+            + u32::from(u16::from_be_bytes([header[4], header[5]]))
+            + u32::from(u16::from_be_bytes([header[6], header[7]]))
+            + u32::from(u16::from_be_bytes([header[8], header[9]]))
+            + u32::from(u16::from_be_bytes([header[12], header[13]]))
+            + u32::from(u16::from_be_bytes([header[14], header[15]]))
+            + u32::from(u16::from_be_bytes([header[16], header[17]]))
+            + u32::from(u16::from_be_bytes([header[18], header[19]]));
+        let folded = (sum & 0xFFFF) + (sum >> 16);
+        let folded = (folded & 0xFFFF) + (folded >> 16);
+        return !(folded as u16);
+    }
+
     let ihl = ((header[0] & 0x0F) as usize) * 4;
     let len = ihl.min(header.len());
     let mut sum: u32 = 0;
