@@ -29,7 +29,7 @@ use tokio_rustls::TlsConnector;
 use crate::config::Config;
 use crate::packet;
 use crate::packet_session::{
-    prune_outbound_queue, PacketSessionConfig, PacketSessionState, CONNECT_TIMEOUT,
+    prune_outbound_queue, CongestionControl, PacketSessionConfig, PacketSessionState, CONNECT_TIMEOUT,
     DEFAULT_INBOUND_QUEUE_CAPACITY, DEFAULT_OUTBOUND_QUEUE_CAPACITY,
 };
 use crate::tls::{self, TlsDerMaterial};
@@ -39,7 +39,10 @@ const H2_DATAGRAM_CAPSULE_TYPE: u64 = 0;
 const H2_INITIAL_STREAM_WINDOW_SIZE: u32 = 8 * 1024 * 1024;
 const H2_INITIAL_CONN_WINDOW_SIZE: u32 = 16 * 1024 * 1024;
 const H2_MAX_FRAME_SIZE: u32 = 65_536;
-const H2_COALESCE_LIMIT: usize = 65_536;
+const H2_SEND_BUFFER_SIZE: usize = 32 * 1024;
+const H2_COALESCE_LIMIT: usize = 16 * 1024;
+#[cfg(target_os = "linux")]
+const H2_TCP_NOTSENT_LOWAT: libc::c_int = 16 * 1024;
 const MAX_CAPSULE_PAYLOAD_LEN: usize = 65_536;
 const H2_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const H2_MIN_PING_INTERVAL: Duration = Duration::from_secs(10);
@@ -78,7 +81,7 @@ impl H2PacketStream {
             .map_err(|e| anyhow::anyhow!("invalid H2 TLS SNI '{}': {e}", session_cfg.sni))?;
 
         tokio::time::timeout(CONNECT_TIMEOUT, async {
-            let tcp = connect_tcp(session_cfg.endpoint, session_cfg.bind).await?;
+            let tcp = connect_tcp(session_cfg.endpoint, session_cfg.bind, session_cfg.congestion_control).await?;
             let connector = TlsConnector::from(tls_config);
             let tls_stream = connector
                 .connect(server_name, tcp)
@@ -99,6 +102,7 @@ impl H2PacketStream {
             .initial_window_size(H2_INITIAL_STREAM_WINDOW_SIZE)
             .initial_connection_window_size(H2_INITIAL_CONN_WINDOW_SIZE)
             .max_frame_size(H2_MAX_FRAME_SIZE)
+            .max_send_buffer_size(H2_SEND_BUFFER_SIZE)
             .enable_push(false)
             .handshake::<IO, Bytes>(io)
             .await
@@ -453,7 +457,11 @@ async fn run_h2_connection<IO>(
     let _ = err_tx.send(reason);
 }
 
-async fn connect_tcp(endpoint: SocketAddr, bind: Option<SocketAddr>) -> Result<TcpStream> {
+async fn connect_tcp(
+    endpoint: SocketAddr,
+    bind: Option<SocketAddr>,
+    cc: CongestionControl,
+) -> Result<TcpStream> {
     let socket = match endpoint {
         SocketAddr::V4(_) => TcpSocket::new_v4(),
         SocketAddr::V6(_) => TcpSocket::new_v6(),
@@ -482,8 +490,53 @@ async fn connect_tcp(endpoint: SocketAddr, bind: Option<SocketAddr>) -> Result<T
         log::debug!("failed to set TCP keepalive on MASQUE H2 socket: {err}");
     }
 
+    configure_linux_tcp_opts(&stream, cc);
+
     Ok(stream)
 }
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn configure_linux_tcp_opts(stream: &TcpStream, cc: CongestionControl) {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+    // Limit unsent kernel TCP queue so low-rate congestion pushes backpressure into
+    // our age-bounded outbound_queue (100ms) instead of bloating latency to 3s+.
+    // SAFETY: valid fd and properly sized c_int value for TCP_NOTSENT_LOWAT.
+    let lowat = H2_TCP_NOTSENT_LOWAT;
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_NOTSENT_LOWAT,
+            (&raw const lowat).cast::<libc::c_void>(),
+            std::mem::size_of_val(&lowat) as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        log::debug!("TCP_NOTSENT_LOWAT setsockopt failed: {}", io::Error::last_os_error());
+    }
+
+    if cc == CongestionControl::Bbr2 {
+        let alg = b"bbr";
+        // SAFETY: valid fd and byte slice length for TCP_CONGESTION.
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_CONGESTION,
+                alg.as_ptr().cast::<libc::c_void>(),
+                alg.len() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            log::debug!("TCP_CONGESTION=bbr unavailable on host kernel: {}", io::Error::last_os_error());
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_linux_tcp_opts(_stream: &TcpStream, _cc: CongestionControl) {}
 
 fn build_connect_ip_request() -> Result<Request<()>> {
     let uri = Uri::builder()
