@@ -272,7 +272,9 @@ impl MasquePacketStream {
             made_progress |= self.poll_h3_events()?;
             made_progress |= self.poll_incoming_datagrams()?;
 
-            if self.has_timeout && self.timeout.as_mut().poll(cx).is_ready() {
+            let timeout_due = self.conn.timeout().is_some_and(|d| d.is_zero())
+                || (self.has_timeout && self.timeout.as_mut().poll(cx).is_ready());
+            if timeout_due {
                 self.conn.on_timeout();
                 self.reset_timeout();
                 made_progress = true;
@@ -446,7 +448,7 @@ impl MasquePacketStream {
                 return Ok(progressed);
             }
 
-            match self.conn.dgram_recv_vec() {
+            match self.conn.dgram_recv_buf() {
                 Ok(dgram) => {
                     progressed = true;
                     if let Some(offset) = parse_datagram_offset(&dgram, self.flow_id) {
@@ -705,7 +707,7 @@ async fn wait_for_connect_response(
 
         loop {
             match h3_conn.poll(conn) {
-                Ok((sid, quiche::h3::Event::Headers { list, has_body: _ })) if sid == stream_id => {
+                Ok((sid, quiche::h3::Event::Headers { list, more_frames: _ })) if sid == stream_id => {
                     for header in &list {
                         if header.name() == b":status" {
                             let status = std::str::from_utf8(header.value()).unwrap_or("?");
@@ -782,7 +784,7 @@ fn flush_pending_queue(
         }
 
         match build_flow_datagram(flow_prefix, packet) {
-            Some(dgram) => match conn.dgram_send_vec(dgram) {
+            Some(dgram) => match conn.dgram_send_buf(dgram) {
                 Ok(()) | Err(quiche::Error::InvalidState) => {
                     let _ = queue.pop_front();
                     progressed = true;

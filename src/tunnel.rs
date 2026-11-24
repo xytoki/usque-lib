@@ -299,7 +299,7 @@ where
 
         loop {
             match h3_conn.poll(&mut conn) {
-                Ok((sid, quiche::h3::Event::Headers { list, has_body: _ })) if sid == stream_id => {
+                Ok((sid, quiche::h3::Event::Headers { list, more_frames: _ })) if sid == stream_id => {
                     for h in &list {
                         if h.name() == b":status" {
                             let status = std::str::from_utf8(h.value()).unwrap_or("?");
@@ -388,7 +388,7 @@ where
             dgram.extend_from_slice(&flow_prefix);
             dgram.extend_from_slice(&pkt);
             let pkt_len = pkt.len() as u64;
-            if conn.dgram_send_vec(dgram).is_ok() {
+            if conn.dgram_send_buf(dgram).is_ok() {
                 stats.tx_packets.fetch_add(1, Ordering::Relaxed);
                 stats.tx_bytes.fetch_add(pkt_len, Ordering::Relaxed);
             }
@@ -422,7 +422,7 @@ where
                         dgram.extend_from_slice(&flow_prefix);
                         dgram.extend_from_slice(pkt);
 
-                        match conn.dgram_send_vec(dgram) {
+                        match conn.dgram_send_buf(dgram) {
                             Ok(()) => {
                                 stats.tx_packets.fetch_add(1, Ordering::Relaxed);
                                 stats.tx_bytes.fetch_add(pkt_len, Ordering::Relaxed);
@@ -493,7 +493,7 @@ where
 
         // Drain received datagrams -> TUN
         loop {
-            match conn.dgram_recv_vec() {
+            match conn.dgram_recv_buf() {
                 Ok(dgram) => {
                     if let Some(ip_payload) = parse_datagram(&dgram, flow_id) {
                         if packet::validate_incoming(ip_payload).is_ok() {
