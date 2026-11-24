@@ -4,10 +4,13 @@ use futures::{Future, Sink, Stream};
 use octets::Octets;
 use quiche::h3::NameValue;
 use ring::rand::SecureRandom;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::fmt;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -23,6 +26,55 @@ use crate::udp_socket::bind_udp_socket;
 const DEFAULT_QUEUE_CAPACITY: usize = 4096;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CongestionControl {
+    #[default]
+    Cubic,
+    #[serde(alias = "bbr", alias = "bbr2_gcongestion")]
+    Bbr2,
+    Reno,
+}
+
+impl CongestionControl {
+    pub const fn to_quiche(self) -> quiche::CongestionControlAlgorithm {
+        match self {
+            Self::Cubic => quiche::CongestionControlAlgorithm::CUBIC,
+            Self::Bbr2 => quiche::CongestionControlAlgorithm::Bbr2Gcongestion,
+            Self::Reno => quiche::CongestionControlAlgorithm::Reno,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cubic => "cubic",
+            Self::Bbr2 => "bbr2",
+            Self::Reno => "reno",
+        }
+    }
+}
+
+impl fmt::Display for CongestionControl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for CongestionControl {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "cubic" => Ok(Self::Cubic),
+            "bbr2" | "bbr" | "bbr2_gcongestion" => Ok(Self::Bbr2),
+            "reno" => Ok(Self::Reno),
+            _ => Err(format!(
+                "unsupported congestion control algorithm '{s}' (expected cubic, bbr2, or reno)"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PacketSessionConfig {
     pub endpoint: SocketAddr,
@@ -30,6 +82,7 @@ pub struct PacketSessionConfig {
     pub sni: String,
     pub keepalive_period: Duration,
     pub mtu: u32,
+    pub congestion_control: CongestionControl,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +125,8 @@ pub struct MasquePacketStream {
     state: PacketSessionState,
     timeout: Pin<Box<Sleep>>,
     has_timeout: bool,
+    pacing_timer: Pin<Box<Sleep>>,
+    pacing_armed_for: Option<std::time::Instant>,
     pending_send: Option<PendingUdpSend>,
     terminal_error: Option<String>,
     emitted_terminal_error: bool,
@@ -80,12 +135,17 @@ pub struct MasquePacketStream {
 struct PendingUdpSend {
     len: usize,
     to: SocketAddr,
+    at: std::time::Instant,
 }
 
 impl MasquePacketStream {
     pub async fn connect(config: Arc<Config>, session_cfg: PacketSessionConfig) -> Result<Self> {
         let tls_material = tls::prepare_tls_material(config.as_ref())?;
-        let mut quic_config = build_quic_config(&tls_material, session_cfg.mtu)?;
+        let mut quic_config = build_quic_config(
+            &tls_material,
+            session_cfg.mtu,
+            session_cfg.congestion_control,
+        )?;
 
         let bind_addr: SocketAddr =
             session_cfg
@@ -197,6 +257,8 @@ impl MasquePacketStream {
             state: PacketSessionState::Ready,
             timeout: Box::pin(tokio::time::sleep(Duration::from_millis(0))),
             has_timeout: false,
+            pacing_timer: Box::pin(tokio::time::sleep(Duration::from_millis(0))),
+            pacing_armed_for: None,
             pending_send: None,
             terminal_error: None,
             emitted_terminal_error: false,
@@ -345,15 +407,37 @@ impl MasquePacketStream {
             if self.pending_send.is_none() {
                 let (write, send_info) = match self.conn.send(&mut self.out) {
                     Ok(result) => result,
-                    Err(quiche::Error::Done) => return Poll::Ready(Ok(flushed)),
+                    Err(quiche::Error::Done) => {
+                        self.pacing_armed_for = None;
+                        return Poll::Ready(Ok(flushed));
+                    }
                     Err(error) => return Poll::Ready(Err(io::Error::other(error.to_string()))),
                 };
 
                 self.pending_send = Some(PendingUdpSend {
                     len: write,
                     to: send_info.to,
+                    at: send_info.at,
                 });
                 self.reset_timeout();
+            }
+
+            let send_at = self.pending_send.as_ref().unwrap().at;
+            if !self.conn.is_closed()
+                && poll_pacing_wait(
+                    &mut self.pacing_timer,
+                    &mut self.pacing_armed_for,
+                    send_at,
+                    std::time::Instant::now(),
+                    cx,
+                )
+                .is_pending()
+            {
+                return if flushed {
+                    Poll::Ready(Ok(true))
+                } else {
+                    Poll::Pending
+                };
             }
 
             match self.socket.poll_send_ready(cx) {
@@ -599,7 +683,31 @@ impl Sink<Bytes> for MasquePacketStream {
     }
 }
 
-fn build_quic_config(tls_material: &tls::TlsMaterial, mtu: u32) -> Result<quiche::Config> {
+fn poll_pacing_wait(
+    pacing_timer: &mut Pin<Box<Sleep>>,
+    pacing_armed_for: &mut Option<std::time::Instant>,
+    send_at: std::time::Instant,
+    now: std::time::Instant,
+    cx: &mut Context<'_>,
+) -> Poll<()> {
+    if send_at > now {
+        if *pacing_armed_for != Some(send_at) {
+            pacing_timer.as_mut().reset(Instant::from_std(send_at));
+            *pacing_armed_for = Some(send_at);
+        }
+        if pacing_timer.as_mut().poll(cx).is_pending() {
+            return Poll::Pending;
+        }
+    }
+    *pacing_armed_for = None;
+    Poll::Ready(())
+}
+
+fn build_quic_config(
+    tls_material: &tls::TlsMaterial,
+    mtu: u32,
+    cc: CongestionControl,
+) -> Result<quiche::Config> {
     let mut quic_config = quiche::Config::new(quiche::PROTOCOL_VERSION)
         .map_err(|e| anyhow::anyhow!("quiche config: {e}"))?;
 
@@ -628,6 +736,8 @@ fn build_quic_config(tls_material: &tls::TlsMaterial, mtu: u32) -> Result<quiche
     quic_config.set_initial_max_streams_uni(100);
     quic_config.set_disable_active_migration(true);
     quic_config.enable_dgram(true, 1000, 1000);
+    quic_config.enable_pacing(true);
+    quic_config.set_cc_algorithm(cc.to_quiche());
 
     Ok(quic_config)
 }
@@ -918,5 +1028,63 @@ mod tests {
         assert_eq!(effective_inner_mtu(Some(1344), 2, 1340), 1340);
         assert_eq!(effective_inner_mtu(Some(2), 2, 1340), 1340);
         assert_eq!(effective_inner_mtu(None, 2, 1340), 1340);
+    }
+
+    #[test]
+    fn congestion_control_parse_and_serde() {
+        assert_eq!(CongestionControl::default(), CongestionControl::Cubic);
+        assert_eq!("cubic".parse::<CongestionControl>().unwrap(), CongestionControl::Cubic);
+        assert_eq!("BBR2".parse::<CongestionControl>().unwrap(), CongestionControl::Bbr2);
+        assert_eq!("bbr".parse::<CongestionControl>().unwrap(), CongestionControl::Bbr2);
+        assert_eq!(
+            "bbr2_gcongestion".parse::<CongestionControl>().unwrap(),
+            CongestionControl::Bbr2
+        );
+        assert_eq!("reno".parse::<CongestionControl>().unwrap(), CongestionControl::Reno);
+        assert!("westwood".parse::<CongestionControl>().is_err());
+
+        assert_eq!(
+            CongestionControl::Cubic.to_quiche(),
+            quiche::CongestionControlAlgorithm::CUBIC
+        );
+        assert_eq!(
+            CongestionControl::Bbr2.to_quiche(),
+            quiche::CongestionControlAlgorithm::Bbr2Gcongestion
+        );
+        assert_eq!(
+            CongestionControl::Reno.to_quiche(),
+            quiche::CongestionControlAlgorithm::Reno
+        );
+
+        let bbr2: CongestionControl = serde_json::from_str("\"bbr\"").unwrap();
+        assert_eq!(bbr2, CongestionControl::Bbr2);
+        assert_eq!(serde_json::to_string(&bbr2).unwrap(), "\"bbr2\"");
+    }
+
+    #[tokio::test]
+    async fn pacing_wait_honors_future_send_at() {
+        let mut timer = Box::pin(tokio::time::sleep(Duration::from_millis(0)));
+        let mut armed_for = None;
+
+        let now = std::time::Instant::now();
+        futures::future::poll_fn(|cx| poll_pacing_wait(&mut timer, &mut armed_for, now, now, cx))
+            .await;
+        assert!(armed_for.is_none());
+
+        let delay = Duration::from_millis(25);
+        let start = std::time::Instant::now();
+        let target = start + delay;
+        futures::future::poll_fn(|cx| {
+            poll_pacing_wait(
+                &mut timer,
+                &mut armed_for,
+                target,
+                std::time::Instant::now(),
+                cx,
+            )
+        })
+        .await;
+        assert!(armed_for.is_none());
+        assert!(start.elapsed() >= Duration::from_millis(20));
     }
 }
