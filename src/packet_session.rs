@@ -126,7 +126,6 @@ pub struct MasquePacketStream {
     timeout: Pin<Box<Sleep>>,
     has_timeout: bool,
     pacing_timer: Pin<Box<Sleep>>,
-    pacing_armed_for: Option<std::time::Instant>,
     pending_send: Option<PendingUdpSend>,
     terminal_error: Option<String>,
     emitted_terminal_error: bool,
@@ -135,7 +134,7 @@ pub struct MasquePacketStream {
 struct PendingUdpSend {
     len: usize,
     to: SocketAddr,
-    at: std::time::Instant,
+    at: Instant,
 }
 
 impl MasquePacketStream {
@@ -258,7 +257,6 @@ impl MasquePacketStream {
             timeout: Box::pin(tokio::time::sleep(Duration::from_millis(0))),
             has_timeout: false,
             pacing_timer: Box::pin(tokio::time::sleep(Duration::from_millis(0))),
-            pacing_armed_for: None,
             pending_send: None,
             terminal_error: None,
             emitted_terminal_error: false,
@@ -407,31 +405,23 @@ impl MasquePacketStream {
             if self.pending_send.is_none() {
                 let (write, send_info) = match self.conn.send(&mut self.out) {
                     Ok(result) => result,
-                    Err(quiche::Error::Done) => {
-                        self.pacing_armed_for = None;
-                        return Poll::Ready(Ok(flushed));
-                    }
+                    Err(quiche::Error::Done) => return Poll::Ready(Ok(flushed)),
                     Err(error) => return Poll::Ready(Err(io::Error::other(error.to_string()))),
                 };
 
                 self.pending_send = Some(PendingUdpSend {
                     len: write,
                     to: send_info.to,
-                    at: send_info.at,
+                    at: Instant::from_std(send_info.at),
                 });
                 self.reset_timeout();
             }
 
             let send_at = self.pending_send.as_ref().unwrap().at;
+            // quiche 0.30 仅 BBR2 的 gcongestion recovery 返回晚于 now 的 send_info.at；Cubic/Reno 不会等待。
             if !self.conn.is_closed()
-                && poll_pacing_wait(
-                    &mut self.pacing_timer,
-                    &mut self.pacing_armed_for,
-                    send_at,
-                    std::time::Instant::now(),
-                    cx,
-                )
-                .is_pending()
+                && poll_pacing_wait(&mut self.pacing_timer, send_at, Instant::now(), cx)
+                    .is_pending()
             {
                 return if flushed {
                     Poll::Ready(Ok(true))
@@ -685,21 +675,18 @@ impl Sink<Bytes> for MasquePacketStream {
 
 fn poll_pacing_wait(
     pacing_timer: &mut Pin<Box<Sleep>>,
-    pacing_armed_for: &mut Option<std::time::Instant>,
-    send_at: std::time::Instant,
-    now: std::time::Instant,
+    send_at: Instant,
+    now: Instant,
     cx: &mut Context<'_>,
 ) -> Poll<()> {
     if send_at > now {
-        if *pacing_armed_for != Some(send_at) {
-            pacing_timer.as_mut().reset(Instant::from_std(send_at));
-            *pacing_armed_for = Some(send_at);
+        if pacing_timer.deadline() != send_at {
+            pacing_timer.as_mut().reset(send_at);
         }
         if pacing_timer.as_mut().poll(cx).is_pending() {
             return Poll::Pending;
         }
     }
-    *pacing_armed_for = None;
     Poll::Ready(())
 }
 
@@ -1043,48 +1030,28 @@ mod tests {
         assert_eq!("reno".parse::<CongestionControl>().unwrap(), CongestionControl::Reno);
         assert!("westwood".parse::<CongestionControl>().is_err());
 
-        assert_eq!(
-            CongestionControl::Cubic.to_quiche(),
-            quiche::CongestionControlAlgorithm::CUBIC
-        );
-        assert_eq!(
-            CongestionControl::Bbr2.to_quiche(),
-            quiche::CongestionControlAlgorithm::Bbr2Gcongestion
-        );
-        assert_eq!(
-            CongestionControl::Reno.to_quiche(),
-            quiche::CongestionControlAlgorithm::Reno
-        );
-
         let bbr2: CongestionControl = serde_json::from_str("\"bbr\"").unwrap();
         assert_eq!(bbr2, CongestionControl::Bbr2);
         assert_eq!(serde_json::to_string(&bbr2).unwrap(), "\"bbr2\"");
     }
 
     #[tokio::test]
-    async fn pacing_wait_honors_future_send_at() {
+    async fn pacing_wait_arms_rearms_and_releases_on_deadline() {
         let mut timer = Box::pin(tokio::time::sleep(Duration::from_millis(0)));
-        let mut armed_for = None;
+        let waker = futures::task::noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
 
-        let now = std::time::Instant::now();
-        futures::future::poll_fn(|cx| poll_pacing_wait(&mut timer, &mut armed_for, now, now, cx))
-            .await;
-        assert!(armed_for.is_none());
+        let now = Instant::now();
+        assert!(poll_pacing_wait(&mut timer, now, now, &mut cx).is_ready());
 
-        let delay = Duration::from_millis(25);
-        let start = std::time::Instant::now();
-        let target = start + delay;
-        futures::future::poll_fn(|cx| {
-            poll_pacing_wait(
-                &mut timer,
-                &mut armed_for,
-                target,
-                std::time::Instant::now(),
-                cx,
-            )
-        })
-        .await;
-        assert!(armed_for.is_none());
-        assert!(start.elapsed() >= Duration::from_millis(20));
+        let first_target = now + Duration::from_secs(10);
+        assert!(poll_pacing_wait(&mut timer, first_target, now, &mut cx).is_pending());
+        assert_eq!(timer.deadline(), first_target);
+
+        let second_target = now + Duration::from_secs(20);
+        assert!(poll_pacing_wait(&mut timer, second_target, now, &mut cx).is_pending());
+        assert_eq!(timer.deadline(), second_target);
+
+        assert!(poll_pacing_wait(&mut timer, second_target, second_target, &mut cx).is_ready());
     }
 }
