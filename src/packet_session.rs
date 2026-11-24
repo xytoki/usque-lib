@@ -23,8 +23,8 @@ use crate::packet;
 use crate::tls;
 use crate::udp_socket::bind_udp_socket;
 
-const DEFAULT_INBOUND_QUEUE_CAPACITY: usize = 4096;
-const DEFAULT_OUTBOUND_QUEUE_CAPACITY: usize = 4096;
+pub(crate) const DEFAULT_INBOUND_QUEUE_CAPACITY: usize = 4096;
+pub(crate) const DEFAULT_OUTBOUND_QUEUE_CAPACITY: usize = 4096;
 const OUTBOUND_QUEUE_MAX_AGE: Duration = Duration::from_millis(100);
 const PACING_BURST_HORIZON: Duration = Duration::from_millis(2);
 const QUICHE_DGRAM_RECV_QUEUE_LEN: usize = 1000;
@@ -34,7 +34,7 @@ const BBR2_MAX_PROBE_UP_QUEUE_ROUNDS: usize = 8;
 const BBR2_PROBE_UP_PACING_GAIN: f32 = 1.5;
 const BBR2_PROBE_BW_CWND_GAIN: f32 = 3.0;
 const BBR2_PROBE_BW_UP_CWND_GAIN: f32 = 3.5;
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -85,6 +85,45 @@ impl FromStr for CongestionControl {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MasqueProtocol {
+    #[default]
+    #[serde(alias = "http3", alias = "quic")]
+    H3,
+    #[serde(alias = "http2", alias = "tcp")]
+    H2,
+}
+
+impl MasqueProtocol {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::H3 => "h3",
+            Self::H2 => "h2",
+        }
+    }
+}
+
+impl fmt::Display for MasqueProtocol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for MasqueProtocol {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "h3" | "http3" | "quic" => Ok(Self::H3),
+            "h2" | "http2" | "tcp" => Ok(Self::H2),
+            _ => Err(format!(
+                "unsupported MASQUE protocol '{s}' (expected h3 or h2)"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PacketSessionConfig {
     pub endpoint: SocketAddr,
@@ -93,6 +132,7 @@ pub struct PacketSessionConfig {
     pub keepalive_period: Duration,
     pub mtu: u32,
     pub congestion_control: CongestionControl,
+    pub protocol: MasqueProtocol,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,7 +158,92 @@ impl SessionLoopOutcome {
     }
 }
 
+use crate::h2_session::H2PacketStream;
+
 pub struct MasquePacketStream {
+    inner: PacketStreamInner,
+}
+
+enum PacketStreamInner {
+    H3(Box<H3PacketStream>),
+    H2(Box<H2PacketStream>),
+}
+
+impl MasquePacketStream {
+    pub async fn connect(config: Arc<Config>, session_cfg: PacketSessionConfig) -> Result<Self> {
+        let inner = match session_cfg.protocol {
+            MasqueProtocol::H3 => {
+                PacketStreamInner::H3(Box::new(H3PacketStream::connect(config, session_cfg).await?))
+            }
+            MasqueProtocol::H2 => {
+                PacketStreamInner::H2(Box::new(H2PacketStream::connect(config, session_cfg).await?))
+            }
+        };
+        Ok(Self { inner })
+    }
+
+    pub fn state(&self) -> PacketSessionState {
+        match &self.inner {
+            PacketStreamInner::H3(s) => s.state(),
+            PacketStreamInner::H2(s) => s.state(),
+        }
+    }
+
+    pub async fn close(&mut self) -> io::Result<()> {
+        match &mut self.inner {
+            PacketStreamInner::H3(s) => s.close().await,
+            PacketStreamInner::H2(s) => {
+                s.close_now();
+                Ok(())
+            }
+        }
+    }
+}
+
+impl Stream for MasquePacketStream {
+    type Item = io::Result<Bytes>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match &mut self.inner {
+            PacketStreamInner::H3(s) => Pin::new(&mut **s).poll_next(cx),
+            PacketStreamInner::H2(s) => Pin::new(&mut **s).poll_next(cx),
+        }
+    }
+}
+
+impl Sink<Bytes> for MasquePacketStream {
+    type Error = io::Error;
+
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match &mut self.inner {
+            PacketStreamInner::H3(s) => Pin::new(&mut **s).poll_ready(cx),
+            PacketStreamInner::H2(s) => Pin::new(&mut **s).poll_ready(cx),
+        }
+    }
+
+    fn start_send(mut self: Pin<&mut Self>, item: Bytes) -> io::Result<()> {
+        match &mut self.inner {
+            PacketStreamInner::H3(s) => Pin::new(&mut **s).start_send(item),
+            PacketStreamInner::H2(s) => Pin::new(&mut **s).start_send(item),
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match &mut self.inner {
+            PacketStreamInner::H3(s) => Pin::new(&mut **s).poll_flush(cx),
+            PacketStreamInner::H2(s) => Pin::new(&mut **s).poll_flush(cx),
+        }
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match &mut self.inner {
+            PacketStreamInner::H3(s) => Pin::new(&mut **s).poll_close(cx),
+            PacketStreamInner::H2(s) => Pin::new(&mut **s).poll_close(cx),
+        }
+    }
+}
+
+struct H3PacketStream {
     socket: tokio::net::UdpSocket,
     conn: quiche::Connection,
     h3_conn: quiche::h3::Connection,
@@ -147,7 +272,7 @@ struct PendingUdpSend {
     at: Instant,
 }
 
-impl MasquePacketStream {
+impl H3PacketStream {
     pub async fn connect(config: Arc<Config>, session_cfg: PacketSessionConfig) -> Result<Self> {
         let tls_material = tls::prepare_tls_material(config.as_ref())?;
         let mut quic_config = build_quic_config(
@@ -553,7 +678,7 @@ impl MasquePacketStream {
     }
 }
 
-impl Stream for MasquePacketStream {
+impl Stream for H3PacketStream {
     type Item = io::Result<Bytes>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -582,7 +707,7 @@ impl Stream for MasquePacketStream {
     }
 }
 
-impl Sink<Bytes> for MasquePacketStream {
+impl Sink<Bytes> for H3PacketStream {
     type Error = io::Error;
 
     fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -887,7 +1012,7 @@ async fn flush_conn_send(
     Ok(())
 }
 
-fn prune_outbound_queue(
+pub(crate) fn prune_outbound_queue(
     queue: &mut VecDeque<(Instant, Bytes)>,
     now: Instant,
     max_len: usize,
@@ -1055,6 +1180,22 @@ mod tests {
         assert_eq!(effective_inner_mtu(Some(1344), 2, 1340), 1340);
         assert_eq!(effective_inner_mtu(Some(2), 2, 1340), 1340);
         assert_eq!(effective_inner_mtu(None, 2, 1340), 1340);
+    }
+
+    #[test]
+    fn masque_protocol_parse_and_serde() {
+        assert_eq!(MasqueProtocol::default(), MasqueProtocol::H3);
+        assert_eq!("h3".parse::<MasqueProtocol>().unwrap(), MasqueProtocol::H3);
+        assert_eq!("http3".parse::<MasqueProtocol>().unwrap(), MasqueProtocol::H3);
+        assert_eq!("quic".parse::<MasqueProtocol>().unwrap(), MasqueProtocol::H3);
+        assert_eq!("h2".parse::<MasqueProtocol>().unwrap(), MasqueProtocol::H2);
+        assert_eq!("HTTP2".parse::<MasqueProtocol>().unwrap(), MasqueProtocol::H2);
+        assert_eq!("tcp".parse::<MasqueProtocol>().unwrap(), MasqueProtocol::H2);
+        assert!("ws".parse::<MasqueProtocol>().is_err());
+
+        let h2: MasqueProtocol = serde_json::from_str(r#""http2""#).unwrap();
+        assert_eq!(h2, MasqueProtocol::H2);
+        assert_eq!(serde_json::to_string(&h2).unwrap(), r#""h2""#);
     }
 
     #[test]

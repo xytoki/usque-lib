@@ -25,6 +25,7 @@
 
 pub mod config;
 pub mod mtu;
+mod h2_session;
 pub mod icmp;
 pub mod packet;
 pub mod packet_session;
@@ -34,4 +35,4 @@ pub mod tun_device;
 pub mod tunnel;
 mod udp_socket;
 
-pub use packet_session::{CongestionControl, MasquePacketStream};
+pub use packet_session::{CongestionControl, MasquePacketStream, MasqueProtocol};

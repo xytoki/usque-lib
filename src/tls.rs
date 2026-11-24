@@ -15,9 +15,16 @@ pub struct TlsMaterial {
     pub endpoint_pub_key_spki_der: Vec<u8>,
 }
 
-/// Generate self-signed client cert from the config private key and prepare
-/// temp PEM files that quiche can load.
-pub fn prepare_tls_material(config: &Config) -> Result<TlsMaterial> {
+/// Holds in-memory DER client credentials and pinned endpoint SPKI for rustls/H2.
+pub struct TlsDerMaterial {
+    pub cert_der: Vec<u8>,
+    pub key_pkcs8_der: Vec<u8>,
+    pub endpoint_pub_key_spki_der: Vec<u8>,
+}
+
+fn generate_self_signed_cert(
+    config: &Config,
+) -> Result<(rcgen::Certificate, String, Vec<u8>, Vec<u8>)> {
     let priv_key_der = config.get_ec_private_key_der()?;
     let signing_key = SigningKey::from_pkcs8_der(&priv_key_der)
         .context("failed to parse ECDSA private key from config")?;
@@ -38,6 +45,20 @@ pub fn prepare_tls_material(config: &Config) -> Result<TlsMaterial> {
         .self_signed(&key_pair)
         .context("failed to generate self-signed certificate")?;
 
+    let endpoint_pub_key_spki_der = config.get_endpoint_pub_key_der()?;
+
+    Ok((
+        cert,
+        key_pair_pem.to_string(),
+        priv_key_der,
+        endpoint_pub_key_spki_der,
+    ))
+}
+
+/// Generate self-signed client cert from the config private key and prepare
+/// temp PEM files that quiche can load.
+pub fn prepare_tls_material(config: &Config) -> Result<TlsMaterial> {
+    let (cert, key_pair_pem, _, endpoint_pub_key_spki_der) = generate_self_signed_cert(config)?;
     let cert_pem = cert.pem();
 
     let mut cert_file = NamedTempFile::new().context("failed to create temp cert file")?;
@@ -48,11 +69,19 @@ pub fn prepare_tls_material(config: &Config) -> Result<TlsMaterial> {
     key_file.write_all(key_pair_pem.as_bytes())?;
     key_file.flush()?;
 
-    let endpoint_pub_key_spki_der = config.get_endpoint_pub_key_der()?;
-
     Ok(TlsMaterial {
         cert_pem_file: cert_file,
         key_pem_file: key_file,
+        endpoint_pub_key_spki_der,
+    })
+}
+
+/// Generate self-signed client cert and PKCS#8 private key in DER for rustls (H2).
+pub fn prepare_tls_der(config: &Config) -> Result<TlsDerMaterial> {
+    let (cert, _, priv_key_der, endpoint_pub_key_spki_der) = generate_self_signed_cert(config)?;
+    Ok(TlsDerMaterial {
+        cert_der: cert.der().to_vec(),
+        key_pkcs8_der: priv_key_der,
         endpoint_pub_key_spki_der,
     })
 }
@@ -71,3 +100,4 @@ pub fn verify_endpoint_key(peer_cert_der: &[u8], expected_spki_der: &[u8]) -> bo
     };
     cert.tbs_certificate.subject_pki.raw == expected_spki_der
 }
+
