@@ -29,8 +29,9 @@ use tokio_rustls::TlsConnector;
 use crate::config::Config;
 use crate::packet;
 use crate::packet_session::{
-    prune_outbound_queue, CongestionControl, PacketSessionConfig, PacketSessionState, CONNECT_TIMEOUT,
-    DEFAULT_INBOUND_QUEUE_CAPACITY, DEFAULT_OUTBOUND_QUEUE_CAPACITY,
+    prune_outbound_queue, CongestionControl, MasqueProtocol, MasqueSessionStats,
+    PacketSessionConfig, PacketSessionState, CONNECT_TIMEOUT, DEFAULT_INBOUND_QUEUE_CAPACITY,
+    DEFAULT_OUTBOUND_QUEUE_CAPACITY,
 };
 use crate::tls::{self, TlsDerMaterial};
 
@@ -54,7 +55,10 @@ pub(crate) struct H2PacketStream {
     _send_request: SendRequest<Bytes>,
     conn_task: JoinHandle<()>,
     conn_err_rx: Option<oneshot::Receiver<String>>,
+    local_addr: SocketAddr,
+    peer_addr: SocketAddr,
     outbound_queue: VecDeque<(Instant, Bytes)>,
+    outbound_queue_drops: u64,
     inbound_queue: VecDeque<Bytes>,
     pending_wire: BytesMut,
     recv_buf: BytesMut,
@@ -82,19 +86,34 @@ impl H2PacketStream {
 
         tokio::time::timeout(CONNECT_TIMEOUT, async {
             let tcp = connect_tcp(session_cfg.endpoint, session_cfg.bind, session_cfg.congestion_control).await?;
+            let local_addr = tcp
+                .local_addr()
+                .context("failed to query MASQUE H2 local socket address")?;
+            let peer_addr = tcp.peer_addr().unwrap_or(session_cfg.endpoint);
             let connector = TlsConnector::from(tls_config);
             let tls_stream = connector
                 .connect(server_name, tcp)
                 .await
                 .context("MASQUE H2 TLS handshake failed")?;
 
-            Self::handshake_over_io(tls_stream, session_cfg.keepalive_period).await
+            Self::handshake_over_io(
+                tls_stream,
+                session_cfg.keepalive_period,
+                local_addr,
+                peer_addr,
+            )
+            .await
         })
         .await
         .map_err(|_| anyhow::anyhow!("MASQUE H2 connection timed out after {CONNECT_TIMEOUT:?}"))?
     }
 
-    async fn handshake_over_io<IO>(io: IO, keepalive_period: Duration) -> Result<Self>
+    async fn handshake_over_io<IO>(
+        io: IO,
+        keepalive_period: Duration,
+        local_addr: SocketAddr,
+        peer_addr: SocketAddr,
+    ) -> Result<Self>
     where
         IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -156,7 +175,10 @@ impl H2PacketStream {
             _send_request: send_request,
             conn_task,
             conn_err_rx: Some(conn_err_rx),
+            local_addr,
+            peer_addr,
             outbound_queue: VecDeque::with_capacity(DEFAULT_OUTBOUND_QUEUE_CAPACITY),
+            outbound_queue_drops: 0,
             inbound_queue: VecDeque::with_capacity(DEFAULT_INBOUND_QUEUE_CAPACITY),
             pending_wire: BytesMut::with_capacity(H2_COALESCE_LIMIT),
             recv_buf: BytesMut::with_capacity(16 * 1024),
@@ -169,6 +191,30 @@ impl H2PacketStream {
 
     pub(crate) const fn state(&self) -> PacketSessionState {
         self.state
+    }
+
+    pub(crate) fn stats(&self) -> MasqueSessionStats {
+        MasqueSessionStats {
+            protocol: MasqueProtocol::H2,
+            local_addr: self.local_addr,
+            peer_addr: self.peer_addr,
+            sent_packets: 0,
+            recv_packets: 0,
+            lost_packets: 0,
+            spurious_lost_packets: 0,
+            dgram_sent: 0,
+            dgram_recv: 0,
+            dgram_lost: 0,
+            sent_bytes: 0,
+            recv_bytes: 0,
+            cwnd_bytes: 0,
+            rtt_ms: 0.0,
+            min_rtt_ms: None,
+            delivery_rate_bps: 0,
+            max_bandwidth_bps: None,
+            outbound_queue_len: self.outbound_queue.len(),
+            outbound_queue_drops: self.outbound_queue_drops,
+        }
     }
 
     pub(crate) fn close_now(&mut self) {
@@ -227,7 +273,8 @@ impl H2PacketStream {
 
     fn fill_pending_wire(&mut self) {
         let now = Instant::now();
-        let _ = prune_outbound_queue(&mut self.outbound_queue, now, usize::MAX);
+        let dropped = prune_outbound_queue(&mut self.outbound_queue, now, usize::MAX);
+        self.outbound_queue_drops = self.outbound_queue_drops.saturating_add(dropped as u64);
 
         while self.pending_wire.len() < H2_COALESCE_LIMIT {
             let Some((_, pkt)) = self.outbound_queue.pop_front() else {
@@ -380,11 +427,12 @@ impl Sink<Bytes> for H2PacketStream {
         }
 
         let now = Instant::now();
-        let _ = prune_outbound_queue(
+        let dropped = prune_outbound_queue(
             &mut self.outbound_queue,
             now,
             DEFAULT_OUTBOUND_QUEUE_CAPACITY.saturating_sub(1),
         );
+        self.outbound_queue_drops = self.outbound_queue_drops.saturating_add(dropped as u64);
         self.outbound_queue.push_back((now, item));
         Ok(())
     }
@@ -810,7 +858,12 @@ mod tests {
             .await;
         });
 
-        let mut stream = H2PacketStream::handshake_over_io(client_io, Duration::from_secs(30))
+        let mut stream = H2PacketStream::handshake_over_io(
+            client_io,
+            Duration::from_secs(30),
+            "[::1]:12345".parse().unwrap(),
+            "[::1]:8095".parse().unwrap(),
+        )
             .await
             .unwrap();
         assert_eq!(stream.state(), PacketSessionState::Ready);
@@ -826,6 +879,11 @@ mod tests {
         assert_eq!(echoed.len(), pkt.len());
         assert_eq!(echoed[8], 63);
 
+        let st = stream.stats();
+        assert_eq!(st.protocol, MasqueProtocol::H2);
+        assert_eq!(st.local_addr, "[::1]:12345".parse::<SocketAddr>().unwrap());
+        assert_eq!(st.peer_addr, "[::1]:8095".parse::<SocketAddr>().unwrap());
+        assert_eq!(st.outbound_queue_drops, 0);
         stream.close_now();
         let _ = server_task.await;
     }

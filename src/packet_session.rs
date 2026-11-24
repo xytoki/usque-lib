@@ -145,6 +145,29 @@ pub enum PacketSessionState {
     Closed,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MasqueSessionStats {
+    pub protocol: MasqueProtocol,
+    pub local_addr: SocketAddr,
+    pub peer_addr: SocketAddr,
+    pub sent_packets: u64,
+    pub recv_packets: u64,
+    pub lost_packets: u64,
+    pub spurious_lost_packets: u64,
+    pub dgram_sent: u64,
+    pub dgram_recv: u64,
+    pub dgram_lost: u64,
+    pub sent_bytes: u64,
+    pub recv_bytes: u64,
+    pub cwnd_bytes: u64,
+    pub rtt_ms: f64,
+    pub min_rtt_ms: Option<f64>,
+    pub delivery_rate_bps: u64,
+    pub max_bandwidth_bps: Option<u64>,
+    pub outbound_queue_len: usize,
+    pub outbound_queue_drops: u64,
+}
+
 #[derive(Debug, Clone)]
 enum SessionLoopOutcome {
     Reconnect(String),
@@ -186,6 +209,13 @@ impl MasquePacketStream {
         match &self.inner {
             PacketStreamInner::H3(s) => s.state(),
             PacketStreamInner::H2(s) => s.state(),
+        }
+    }
+
+    pub fn stats(&self) -> MasqueSessionStats {
+        match &self.inner {
+            PacketStreamInner::H3(s) => s.stats(),
+            PacketStreamInner::H2(s) => s.stats(),
         }
     }
 
@@ -252,6 +282,7 @@ struct H3PacketStream {
     flow_prefix: Vec<u8>,
     mtu: u16,
     outbound_queue: VecDeque<(Instant, Bytes)>,
+    outbound_queue_drops: u64,
     inbound_queue: VecDeque<Bytes>,
     out: Vec<u8>,
     buf: Vec<u8>,
@@ -383,6 +414,7 @@ impl H3PacketStream {
             flow_prefix: build_flow_prefix(flow_id),
             mtu: session_cfg.mtu.min(u32::from(u16::MAX)) as u16,
             outbound_queue: VecDeque::new(),
+            outbound_queue_drops: 0,
             inbound_queue: VecDeque::new(),
             out,
             buf,
@@ -402,6 +434,40 @@ impl H3PacketStream {
 
     pub fn state(&self) -> PacketSessionState {
         self.state
+    }
+
+    pub fn stats(&self) -> MasqueSessionStats {
+        let st = self.conn.stats();
+        let path = self.conn.path_stats().next();
+        MasqueSessionStats {
+            protocol: MasqueProtocol::H3,
+            local_addr: self.local_addr,
+            peer_addr: self.endpoint,
+            sent_packets: st.sent as u64,
+            recv_packets: st.recv as u64,
+            lost_packets: st.lost as u64,
+            spurious_lost_packets: st.spurious_lost as u64,
+            dgram_sent: st.dgram_sent as u64,
+            dgram_recv: st.dgram_recv as u64,
+            dgram_lost: path.as_ref().map_or(0, |p| p.dgram_lost as u64),
+            sent_bytes: st.sent_bytes,
+            recv_bytes: st.recv_bytes,
+            cwnd_bytes: path.as_ref().map_or(0, |p| p.cwnd as u64),
+            rtt_ms: path.as_ref().map_or(0.0, |p| p.rtt.as_secs_f64() * 1000.0),
+            min_rtt_ms: path
+                .as_ref()
+                .and_then(|p| p.min_rtt)
+                .map(|d| d.as_secs_f64() * 1000.0),
+            delivery_rate_bps: path
+                .as_ref()
+                .map_or(0, |p| p.delivery_rate.saturating_mul(8)),
+            max_bandwidth_bps: path
+                .as_ref()
+                .and_then(|p| p.max_bandwidth)
+                .map(|b| b.saturating_mul(8)),
+            outbound_queue_len: self.outbound_queue.len(),
+            outbound_queue_drops: self.outbound_queue_drops,
+        }
     }
 
     pub async fn close(&mut self) -> io::Result<()> {
@@ -450,6 +516,7 @@ impl H3PacketStream {
                 &self.flow_prefix,
                 self.mtu,
                 &mut self.outbound_queue,
+                &mut self.outbound_queue_drops,
                 &mut self.inbound_queue,
             );
             match self.poll_flush_conn_send(cx) {
@@ -740,11 +807,12 @@ impl Sink<Bytes> for H3PacketStream {
         }
 
         let now = Instant::now();
-        prune_outbound_queue(
+        let dropped = prune_outbound_queue(
             &mut self.outbound_queue,
             now,
             DEFAULT_OUTBOUND_QUEUE_CAPACITY.saturating_sub(1),
         );
+        self.outbound_queue_drops = self.outbound_queue_drops.saturating_add(dropped as u64);
         self.outbound_queue.push_back((now, item));
         Ok(())
     }
@@ -1016,14 +1084,14 @@ pub(crate) fn prune_outbound_queue(
     queue: &mut VecDeque<(Instant, Bytes)>,
     now: Instant,
     max_len: usize,
-) -> bool {
-    let mut dropped = false;
+) -> usize {
+    let mut dropped = 0_usize;
     while let Some((enqueued_at, _)) = queue.front() {
         if now.saturating_duration_since(*enqueued_at) > OUTBOUND_QUEUE_MAX_AGE
             || queue.len() > max_len
         {
             let _ = queue.pop_front();
-            dropped = true;
+            dropped += 1;
         } else {
             break;
         }
@@ -1036,9 +1104,12 @@ fn flush_pending_queue(
     flow_prefix: &[u8],
     mtu: u16,
     queue: &mut VecDeque<(Instant, Bytes)>,
+    outbound_queue_drops: &mut u64,
     inbound_queue: &mut VecDeque<Bytes>,
 ) -> bool {
-    let mut progressed = prune_outbound_queue(queue, Instant::now(), usize::MAX);
+    let dropped = prune_outbound_queue(queue, Instant::now(), usize::MAX);
+    *outbound_queue_drops = outbound_queue_drops.saturating_add(dropped as u64);
+    let mut progressed = dropped > 0;
 
     while let Some((_, packet)) = queue.front() {
         if conn.is_dgram_send_queue_full() {
@@ -1248,9 +1319,9 @@ mod tests {
         ]);
 
         let now = base + Duration::from_millis(120);
-        assert!(prune_outbound_queue(&mut queue, now, 2));
+        assert_eq!(prune_outbound_queue(&mut queue, now, 2), 2);
         let remaining: Vec<&[u8]> = queue.iter().map(|(_, p)| p.as_ref()).collect();
         assert_eq!(remaining, vec![b"fresh-2".as_slice(), b"fresh-3".as_slice()]);
-        assert!(!prune_outbound_queue(&mut queue, now, 2));
+        assert_eq!(prune_outbound_queue(&mut queue, now, 2), 0);
     }
 }
