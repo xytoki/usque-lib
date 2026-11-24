@@ -23,7 +23,11 @@ use crate::packet;
 use crate::tls;
 use crate::udp_socket::bind_udp_socket;
 
-const DEFAULT_QUEUE_CAPACITY: usize = 4096;
+const DEFAULT_INBOUND_QUEUE_CAPACITY: usize = 4096;
+const DEFAULT_OUTBOUND_QUEUE_CAPACITY: usize = 32;
+const QUICHE_DGRAM_RECV_QUEUE_LEN: usize = 1000;
+const QUICHE_DGRAM_SEND_QUEUE_LEN: usize = 32;
+const BBR2_LOSS_THRESHOLD: f32 = 0.20;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -518,7 +522,7 @@ impl MasquePacketStream {
         let mut progressed = false;
 
         loop {
-            if self.inbound_queue.len() >= DEFAULT_QUEUE_CAPACITY {
+            if self.inbound_queue.len() >= DEFAULT_INBOUND_QUEUE_CAPACITY {
                 return Ok(progressed);
             }
 
@@ -584,22 +588,15 @@ impl Sink<Bytes> for MasquePacketStream {
             return Poll::Ready(Err(self.terminal_io_error()));
         }
 
-        if self.outbound_queue.len() >= DEFAULT_QUEUE_CAPACITY {
-            match self.poll_drive(cx) {
-                Poll::Ready(Ok(())) => {}
-                Poll::Ready(Err(error)) => {
-                    self.set_terminal_error(error.to_string());
-                    return Poll::Ready(Err(error));
-                }
-                Poll::Pending => return Poll::Pending,
+        if self.outbound_queue.len() >= DEFAULT_OUTBOUND_QUEUE_CAPACITY {
+            if let Poll::Ready(Err(error)) = self.poll_drive(cx) {
+                self.set_terminal_error(error.to_string());
+                return Poll::Ready(Err(error));
             }
         }
 
-        if self.outbound_queue.len() < DEFAULT_QUEUE_CAPACITY {
-            Poll::Ready(Ok(()))
-        } else {
-            Poll::Pending
-        }
+        // 不可靠 datagram 隧道满队时不向上游反压（避免上层桥接继续囤包），由 start_send 丢弃最旧包。
+        Poll::Ready(Ok(()))
     }
 
     fn start_send(mut self: Pin<&mut Self>, item: Bytes) -> io::Result<()> {
@@ -611,11 +608,8 @@ impl Sink<Bytes> for MasquePacketStream {
             return Err(self.terminal_io_error());
         }
 
-        if self.outbound_queue.len() >= DEFAULT_QUEUE_CAPACITY {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "MASQUE outbound queue is full",
-            ));
+        if self.outbound_queue.len() >= DEFAULT_OUTBOUND_QUEUE_CAPACITY {
+            let _ = self.outbound_queue.pop_front();
         }
 
         self.outbound_queue.push_back(item);
@@ -722,9 +716,20 @@ fn build_quic_config(
     quic_config.set_initial_max_streams_bidi(100);
     quic_config.set_initial_max_streams_uni(100);
     quic_config.set_disable_active_migration(true);
-    quic_config.enable_dgram(true, 1000, 1000);
+    quic_config.enable_dgram(
+        true,
+        QUICHE_DGRAM_RECV_QUEUE_LEN,
+        QUICHE_DGRAM_SEND_QUEUE_LEN,
+    );
     quic_config.enable_pacing(true);
     quic_config.set_cc_algorithm(cc.to_quiche());
+    if cc == CongestionControl::Bbr2 {
+        // quiche 0.30 默认 loss_threshold=0.015，跨境高随机丢包链路会反复触发 0.7x 降速。
+        quic_config.set_custom_bbr_params(quiche::BbrParams {
+            loss_threshold: Some(BBR2_LOSS_THRESHOLD),
+            ..Default::default()
+        });
+    }
 
     Ok(quic_config)
 }
@@ -902,7 +907,7 @@ fn flush_pending_queue(
                     log::debug!(
                         "datagram send error: {error}, generating ICMP Packet Too Big (mtu={effective_mtu})"
                     );
-                    if inbound_queue.len() < DEFAULT_QUEUE_CAPACITY {
+                    if inbound_queue.len() < DEFAULT_INBOUND_QUEUE_CAPACITY {
                         if let Some(icmp_pkt) = icmp::compose_icmp_too_large(&packet, effective_mtu)
                         {
                             inbound_queue.push_back(Bytes::from(icmp_pkt));

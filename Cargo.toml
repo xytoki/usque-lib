@@ -10,7 +10,7 @@ name = "usque-rs"
 path = "src/main.rs"
 
 [dependencies]
-quiche = "0.30"
+quiche = { version = "0.30", features = ["internal"] }
 octets = "0.3"
 bytes = "1"
 
