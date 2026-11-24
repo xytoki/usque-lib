@@ -24,10 +24,16 @@ use crate::tls;
 use crate::udp_socket::bind_udp_socket;
 
 const DEFAULT_INBOUND_QUEUE_CAPACITY: usize = 4096;
-const DEFAULT_OUTBOUND_QUEUE_CAPACITY: usize = 32;
+const DEFAULT_OUTBOUND_QUEUE_CAPACITY: usize = 4096;
+const OUTBOUND_QUEUE_MAX_AGE: Duration = Duration::from_millis(100);
+const PACING_BURST_HORIZON: Duration = Duration::from_millis(2);
 const QUICHE_DGRAM_RECV_QUEUE_LEN: usize = 1000;
 const QUICHE_DGRAM_SEND_QUEUE_LEN: usize = 32;
 const BBR2_LOSS_THRESHOLD: f32 = 0.20;
+const BBR2_MAX_PROBE_UP_QUEUE_ROUNDS: usize = 8;
+const BBR2_PROBE_UP_PACING_GAIN: f32 = 1.5;
+const BBR2_PROBE_BW_CWND_GAIN: f32 = 3.0;
+const BBR2_PROBE_BW_UP_CWND_GAIN: f32 = 3.5;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,7 +126,7 @@ pub struct MasquePacketStream {
     flow_id: u64,
     flow_prefix: Vec<u8>,
     mtu: u16,
-    outbound_queue: VecDeque<Bytes>,
+    outbound_queue: VecDeque<(Instant, Bytes)>,
     inbound_queue: VecDeque<Bytes>,
     out: Vec<u8>,
     buf: Vec<u8>,
@@ -608,11 +614,13 @@ impl Sink<Bytes> for MasquePacketStream {
             return Err(self.terminal_io_error());
         }
 
-        if self.outbound_queue.len() >= DEFAULT_OUTBOUND_QUEUE_CAPACITY {
-            let _ = self.outbound_queue.pop_front();
-        }
-
-        self.outbound_queue.push_back(item);
+        let now = Instant::now();
+        prune_outbound_queue(
+            &mut self.outbound_queue,
+            now,
+            DEFAULT_OUTBOUND_QUEUE_CAPACITY.saturating_sub(1),
+        );
+        self.outbound_queue.push_back((now, item));
         Ok(())
     }
 
@@ -673,7 +681,8 @@ fn poll_pacing_wait(
     now: Instant,
     cx: &mut Context<'_>,
 ) -> Poll<()> {
-    if send_at > now {
+    // 跳过 <=2ms 的微小间隔，避免逐包触发 1ms 时间轮 Sleep 过睡并被 quiche pacer 累加限速。
+    if send_at.saturating_duration_since(now) > PACING_BURST_HORIZON {
         if pacing_timer.deadline() != send_at {
             pacing_timer.as_mut().reset(send_at);
         }
@@ -724,9 +733,16 @@ fn build_quic_config(
     quic_config.enable_pacing(true);
     quic_config.set_cc_algorithm(cc.to_quiche());
     if cc == CongestionControl::Bbr2 {
-        // quiche 0.30 默认 loss_threshold=0.015，跨境高随机丢包链路会反复触发 0.7x 降速。
+        // 1. 首次假丢包后关闭 MAX_PACKET_THRESHOLD=20，改用自适应时间阈值抗高乱序（避免误触发 ProbeBW 0.7^k 降速）；
+        // 2. 放宽 ProbeBW 队列轮数、上探 pacing_gain 与窗口增益，避免常态 RTT≈2×min_rtt 时 ProbeUp 2 轮即退出且 Cruise 被 cwnd 卡死；
+        // 注：不启用实验性 InflightReduction，其在 quiche 0.30 Startup 丢单包时会锁死 bandwidth_lo。
+        quic_config.set_enable_relaxed_loss_threshold(true);
         quic_config.set_custom_bbr_params(quiche::BbrParams {
             loss_threshold: Some(BBR2_LOSS_THRESHOLD),
+            max_probe_up_queue_rounds: Some(BBR2_MAX_PROBE_UP_QUEUE_ROUNDS),
+            probe_bw_probe_up_pacing_gain: Some(BBR2_PROBE_UP_PACING_GAIN),
+            probe_bw_cwnd_gain: Some(BBR2_PROBE_BW_CWND_GAIN),
+            probe_bw_up_cwnd_gain: Some(BBR2_PROBE_BW_UP_CWND_GAIN),
             ..Default::default()
         });
     }
@@ -871,16 +887,35 @@ async fn flush_conn_send(
     Ok(())
 }
 
+fn prune_outbound_queue(
+    queue: &mut VecDeque<(Instant, Bytes)>,
+    now: Instant,
+    max_len: usize,
+) -> bool {
+    let mut dropped = false;
+    while let Some((enqueued_at, _)) = queue.front() {
+        if now.saturating_duration_since(*enqueued_at) > OUTBOUND_QUEUE_MAX_AGE
+            || queue.len() > max_len
+        {
+            let _ = queue.pop_front();
+            dropped = true;
+        } else {
+            break;
+        }
+    }
+    dropped
+}
+
 fn flush_pending_queue(
     conn: &mut quiche::Connection,
     flow_prefix: &[u8],
     mtu: u16,
-    queue: &mut VecDeque<Bytes>,
+    queue: &mut VecDeque<(Instant, Bytes)>,
     inbound_queue: &mut VecDeque<Bytes>,
 ) -> bool {
-    let mut progressed = false;
+    let mut progressed = prune_outbound_queue(queue, Instant::now(), usize::MAX);
 
-    while let Some(packet) = queue.front() {
+    while let Some((_, packet)) = queue.front() {
         if conn.is_dgram_send_queue_full() {
             break;
         }
@@ -895,7 +930,7 @@ fn flush_pending_queue(
                     break;
                 }
                 Err(error) => {
-                    let Some(packet) = queue.pop_front() else {
+                    let Some((_, packet)) = queue.pop_front() else {
                         break;
                     };
                     progressed = true;
@@ -1048,6 +1083,7 @@ mod tests {
 
         let now = Instant::now();
         assert!(poll_pacing_wait(&mut timer, now, now, &mut cx).is_ready());
+        assert!(poll_pacing_wait(&mut timer, now + PACING_BURST_HORIZON, now, &mut cx).is_ready());
 
         let first_target = now + Duration::from_secs(10);
         assert!(poll_pacing_wait(&mut timer, first_target, now, &mut cx).is_pending());
@@ -1058,5 +1094,22 @@ mod tests {
         assert_eq!(timer.deadline(), second_target);
 
         assert!(poll_pacing_wait(&mut timer, second_target, second_target, &mut cx).is_ready());
+    }
+
+    #[test]
+    fn prune_outbound_queue_drops_expired_and_enforces_capacity() {
+        let base = Instant::now();
+        let mut queue = VecDeque::from([
+            (base, Bytes::from_static(b"expired")),
+            (base + Duration::from_millis(60), Bytes::from_static(b"fresh-1")),
+            (base + Duration::from_millis(90), Bytes::from_static(b"fresh-2")),
+            (base + Duration::from_millis(100), Bytes::from_static(b"fresh-3")),
+        ]);
+
+        let now = base + Duration::from_millis(120);
+        assert!(prune_outbound_queue(&mut queue, now, 2));
+        let remaining: Vec<&[u8]> = queue.iter().map(|(_, p)| p.as_ref()).collect();
+        assert_eq!(remaining, vec![b"fresh-2".as_slice(), b"fresh-3".as_slice()]);
+        assert!(!prune_outbound_queue(&mut queue, now, 2));
     }
 }
