@@ -1,5 +1,5 @@
 use anyhow::{bail, Result};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::{Future, Sink, Stream};
 use octets::Octets;
 use quiche::h3::NameValue;
@@ -27,8 +27,26 @@ pub(crate) const DEFAULT_INBOUND_QUEUE_CAPACITY: usize = 4096;
 pub(crate) const DEFAULT_OUTBOUND_QUEUE_CAPACITY: usize = 4096;
 const OUTBOUND_QUEUE_MAX_AGE: Duration = Duration::from_millis(100);
 const PACING_BURST_HORIZON: Duration = Duration::from_millis(2);
-const QUICHE_DGRAM_RECV_QUEUE_LEN: usize = 1000;
-const QUICHE_DGRAM_SEND_QUEUE_LEN: usize = 32;
+const QUICHE_DGRAM_RECV_QUEUE_LEN: usize = 4096;
+const QUICHE_DGRAM_SEND_QUEUE_LEN: usize = 1024;
+const UDP_RECV_MAX_PER_POLL: usize = 128;
+const INBOUND_SLAB_CAPACITY: usize = 64 * 1024;
+#[cfg(target_os = "linux")]
+const UDP_RECV_GRO_SLOTS: usize = 8;
+#[cfg(target_os = "linux")]
+const UDP_RECV_GRO_SLOT_CAP: usize = 65536;
+#[cfg(target_os = "linux")]
+const UDP_RECV_PLAIN_SLOTS: usize = 32;
+#[cfg(target_os = "linux")]
+const UDP_RECV_PLAIN_SLOT_CAP: usize = 2048;
+#[cfg(target_os = "linux")]
+const UDP_RECV_CMSG_SIZE: usize = 64;
+#[cfg(target_os = "linux")]
+const UDP_GRO_OPT: libc::c_int = 104;
+#[cfg(target_os = "linux")]
+const CACHE_LINE_BYTES: usize = 64;
+#[cfg(target_os = "linux")]
+const PAGE_BYTES: usize = 4096;
 const BBR2_LOSS_THRESHOLD: f32 = 0.20;
 const BBR2_MAX_PROBE_UP_QUEUE_ROUNDS: usize = 8;
 const BBR2_PROBE_UP_PACING_GAIN: f32 = 1.5;
@@ -283,6 +301,9 @@ struct H3PacketStream {
     mtu: u16,
     outbound_queue: VecDeque<(Instant, Bytes)>,
     outbound_queue_drops: u64,
+    inbound_slab: BytesMut,
+    #[cfg(target_os = "linux")]
+    recv_batch: RecvMmsgGroBuf,
     inbound_queue: VecDeque<Bytes>,
     out: Vec<u8>,
     buf: Vec<u8>,
@@ -295,6 +316,153 @@ struct H3PacketStream {
     pending_send: Option<PendingUdpSend>,
     terminal_error: Option<String>,
     emitted_terminal_error: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn recv_slot_stride(slot_cap: usize) -> usize {
+    let cap = slot_cap.max(1);
+    let aligned = (cap + (CACHE_LINE_BYTES - 1)) & !(CACHE_LINE_BYTES - 1);
+    if aligned % PAGE_BYTES == 0 {
+        aligned + CACHE_LINE_BYTES
+    } else {
+        aligned
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct RecvMmsgGroBuf {
+    gro_enabled: bool,
+    slots: usize,
+    slot_cap: usize,
+    stride: usize,
+    slab: Box<[u8]>,
+    cmsgs: Box<[u8]>,
+    _iovecs: Box<[libc::iovec]>,
+    headers: Box<[libc::mmsghdr]>,
+}
+
+#[cfg(target_os = "linux")]
+// SAFETY: All raw pointers inside `headers`/`_iovecs` target exclusively owned boxed slices
+// (`slab`, `cmsgs`, `_iovecs`) whose heap addresses remain fixed across moves.
+#[allow(clippy::non_send_fields_in_send_ty)]
+unsafe impl Send for RecvMmsgGroBuf {}
+
+#[cfg(target_os = "linux")]
+impl RecvMmsgGroBuf {
+    fn new(gro_enabled: bool) -> Self {
+        let (slots, slot_cap, cmsg_size) = if gro_enabled {
+            (UDP_RECV_GRO_SLOTS, UDP_RECV_GRO_SLOT_CAP, UDP_RECV_CMSG_SIZE)
+        } else {
+            (UDP_RECV_PLAIN_SLOTS, UDP_RECV_PLAIN_SLOT_CAP, 0)
+        };
+        let stride = recv_slot_stride(slot_cap);
+        let mut slab = vec![0_u8; slots * stride].into_boxed_slice();
+        let mut cmsgs = vec![0_u8; slots * cmsg_size].into_boxed_slice();
+        let mut iovecs = Vec::with_capacity(slots);
+        for i in 0..slots {
+            let ptr = unsafe { slab.as_mut_ptr().add(i * stride) };
+            iovecs.push(libc::iovec {
+                iov_base: ptr.cast(),
+                iov_len: slot_cap,
+            });
+        }
+        let mut iovecs = iovecs.into_boxed_slice();
+        let mut headers = Vec::with_capacity(slots);
+        for i in 0..slots {
+            let mut hdr: libc::mmsghdr = unsafe { std::mem::zeroed() };
+            hdr.msg_hdr.msg_iov = unsafe { iovecs.as_mut_ptr().add(i) };
+            hdr.msg_hdr.msg_iovlen = 1;
+            if cmsg_size > 0 {
+                hdr.msg_hdr.msg_control = unsafe { cmsgs.as_mut_ptr().add(i * cmsg_size).cast() };
+                hdr.msg_hdr.msg_controllen = cmsg_size;
+            }
+            headers.push(hdr);
+        }
+        Self {
+            gro_enabled,
+            slots,
+            slot_cap,
+            stride,
+            slab,
+            cmsgs,
+            _iovecs: iovecs,
+            headers: headers.into_boxed_slice(),
+        }
+    }
+
+    fn try_enable_udp_gro(socket: &tokio::net::UdpSocket) -> bool {
+        use std::os::fd::AsRawFd;
+        let enable: libc::c_int = 1;
+        let ret = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::IPPROTO_UDP,
+                UDP_GRO_OPT,
+                std::ptr::addr_of!(enable).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        ret == 0
+    }
+
+    fn try_recv_batch(&mut self, socket: &tokio::net::UdpSocket) -> io::Result<Option<usize>> {
+        use std::os::fd::AsRawFd;
+        use tokio::io::Interest;
+        let slots = self.slots;
+        let gro_enabled = self.gro_enabled;
+        match socket.try_io(Interest::READABLE, || {
+            let fd = socket.as_raw_fd();
+            for i in 0..slots {
+                self.headers[i].msg_len = 0;
+                self.headers[i].msg_hdr.msg_flags = 0;
+                if gro_enabled {
+                    self.headers[i].msg_hdr.msg_control =
+                        unsafe { self.cmsgs.as_mut_ptr().add(i * UDP_RECV_CMSG_SIZE).cast() };
+                    self.headers[i].msg_hdr.msg_controllen = UDP_RECV_CMSG_SIZE;
+                }
+            }
+            let n = unsafe {
+                libc::recvmmsg(
+                    fd,
+                    self.headers.as_mut_ptr(),
+                    slots as u32,
+                    libc::MSG_DONTWAIT,
+                    std::ptr::null_mut(),
+                )
+            };
+            if n < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(n as usize)
+            }
+        }) {
+            Ok(n) => Ok(Some(n)),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn slot_mut(&mut self, idx: usize) -> (&mut [u8], usize) {
+        let total_len = (self.headers[idx].msg_len as usize).min(self.slot_cap);
+        let mut gso_size = 0usize;
+        if self.gro_enabled {
+            unsafe {
+                let hdr = &self.headers[idx].msg_hdr;
+                let mut cmsg = libc::CMSG_FIRSTHDR(hdr);
+                while !cmsg.is_null() {
+                    if (*cmsg).cmsg_level == libc::IPPROTO_UDP && (*cmsg).cmsg_type == UDP_GRO_OPT {
+                        let mut raw = [0_u8; 2];
+                        std::ptr::copy_nonoverlapping(libc::CMSG_DATA(cmsg), raw.as_mut_ptr(), 2);
+                        gso_size = usize::from(u16::from_ne_bytes(raw));
+                        break;
+                    }
+                    cmsg = libc::CMSG_NXTHDR(hdr, cmsg);
+                }
+            }
+        }
+        let start = idx * self.stride;
+        (&mut self.slab[start..start + total_len], gso_size)
+    }
 }
 
 struct PendingUdpSend {
@@ -405,6 +573,8 @@ impl H3PacketStream {
             anyhow::anyhow!("MASQUE connect timed out after {}s", CONNECT_TIMEOUT.as_secs())
         })??;
 
+        #[cfg(target_os = "linux")]
+        let gro_enabled = RecvMmsgGroBuf::try_enable_udp_gro(&socket);
         let mut stream = Self {
             socket,
             conn,
@@ -415,6 +585,9 @@ impl H3PacketStream {
             mtu: session_cfg.mtu.min(u32::from(u16::MAX)) as u16,
             outbound_queue: VecDeque::new(),
             outbound_queue_drops: 0,
+            inbound_slab: BytesMut::with_capacity(INBOUND_SLAB_CAPACITY),
+            #[cfg(target_os = "linux")]
+            recv_batch: RecvMmsgGroBuf::new(gro_enabled),
             inbound_queue: VecDeque::new(),
             out,
             buf,
@@ -565,33 +738,77 @@ impl H3PacketStream {
     }
 
     fn poll_recv_udp(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+        if self.inbound_queue.len() >= DEFAULT_INBOUND_QUEUE_CAPACITY {
+            return Poll::Pending;
+        }
         let mut received = false;
+        let mut total_cnt = 0usize;
 
         loop {
+            if total_cnt >= UDP_RECV_MAX_PER_POLL {
+                if received {
+                    self.reset_timeout();
+                }
+                return Poll::Ready(Ok(true));
+            }
+
             match self.socket.poll_recv_ready(cx) {
                 Poll::Ready(Ok(())) => {}
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
                 Poll::Pending => {
-                    return if received {
-                        Poll::Ready(Ok(true))
-                    } else {
-                        Poll::Pending
-                    };
+                    if received {
+                        self.reset_timeout();
+                        return Poll::Ready(Ok(true));
+                    }
+                    return Poll::Pending;
                 }
             }
 
+            let recv_info = quiche::RecvInfo {
+                to: self.local_addr,
+                from: self.endpoint,
+            };
+
+            #[cfg(target_os = "linux")]
             loop {
+                if total_cnt >= UDP_RECV_MAX_PER_POLL {
+                    break;
+                }
+                match self.recv_batch.try_recv_batch(&self.socket)? {
+                    Some(0) | None => break,
+                    Some(n) => {
+                        for i in 0..n {
+                            let (buf, gso_size) = self.recv_batch.slot_mut(i);
+                            if gso_size > 0 && buf.len() > gso_size {
+                                for chunk in buf.chunks_mut(gso_size) {
+                                    if let Err(error) = self.conn.recv(chunk, recv_info) {
+                                        log::debug!("quic recv error: {error}");
+                                    }
+                                    total_cnt += 1;
+                                }
+                            } else {
+                                if let Err(error) = self.conn.recv(buf, recv_info) {
+                                    log::debug!("quic recv error: {error}");
+                                }
+                                total_cnt += 1;
+                            }
+                        }
+                        received = true;
+                    }
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            loop {
+                if total_cnt >= UDP_RECV_MAX_PER_POLL {
+                    break;
+                }
                 match self.socket.try_recv(&mut self.buf) {
                     Ok(len) => {
-                        let recv_info = quiche::RecvInfo {
-                            to: self.local_addr,
-                            from: self.endpoint,
-                        };
                         if let Err(error) = self.conn.recv(&mut self.buf[..len], recv_info) {
                             log::debug!("quic recv error: {error}");
                         }
+                        total_cnt += 1;
                         received = true;
-                        self.reset_timeout();
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                     Err(error) => return Poll::Ready(Err(error)),
@@ -602,13 +819,25 @@ impl H3PacketStream {
 
     fn poll_flush_conn_send(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
         let mut flushed = false;
+        let mut generated = false;
+        let mut cached_now: Option<Instant> = None;
 
         loop {
             if self.pending_send.is_none() {
                 let (write, send_info) = match self.conn.send(&mut self.out) {
                     Ok(result) => result,
-                    Err(quiche::Error::Done) => return Poll::Ready(Ok(flushed)),
-                    Err(error) => return Poll::Ready(Err(io::Error::other(error.to_string()))),
+                    Err(quiche::Error::Done) => {
+                        if generated {
+                            self.reset_timeout();
+                        }
+                        return Poll::Ready(Ok(flushed));
+                    }
+                    Err(error) => {
+                        if generated {
+                            self.reset_timeout();
+                        }
+                        return Poll::Ready(Err(io::Error::other(error.to_string())));
+                    }
                 };
 
                 self.pending_send = Some(PendingUdpSend {
@@ -616,26 +845,44 @@ impl H3PacketStream {
                     to: send_info.to,
                     at: Instant::from_std(send_info.at),
                 });
-                self.reset_timeout();
+                generated = true;
             }
 
             let send_at = self.pending_send.as_ref().unwrap().at;
             // quiche 0.30 仅 BBR2 的 gcongestion recovery 返回晚于 now 的 send_info.at；Cubic/Reno 不会等待。
-            if !self.conn.is_closed()
-                && poll_pacing_wait(&mut self.pacing_timer, send_at, Instant::now(), cx)
-                    .is_pending()
-            {
-                return if flushed {
-                    Poll::Ready(Ok(true))
-                } else {
-                    Poll::Pending
+            if !self.conn.is_closed() {
+                let now = match cached_now {
+                    Some(now) if send_at <= now + PACING_BURST_HORIZON => now,
+                    _ => {
+                        let fresh = Instant::now();
+                        cached_now = Some(fresh);
+                        fresh
+                    }
                 };
+                if poll_pacing_wait(&mut self.pacing_timer, send_at, now, cx).is_pending() {
+                    if generated {
+                        self.reset_timeout();
+                    }
+                    return if flushed {
+                        Poll::Ready(Ok(true))
+                    } else {
+                        Poll::Pending
+                    };
+                }
             }
 
             match self.socket.poll_send_ready(cx) {
                 Poll::Ready(Ok(())) => {}
-                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Ready(Err(error)) => {
+                    if generated {
+                        self.reset_timeout();
+                    }
+                    return Poll::Ready(Err(error));
+                }
                 Poll::Pending => {
+                    if generated {
+                        self.reset_timeout();
+                    }
                     return if flushed {
                         Poll::Ready(Ok(true))
                     } else {
@@ -724,19 +971,32 @@ impl H3PacketStream {
                 return Ok(progressed);
             }
 
-            match self.conn.dgram_recv_buf() {
-                Ok(dgram) => {
+            let Some(next_len) = self.conn.dgram_recv_front_len() else {
+                return Ok(progressed);
+            };
+            if self.inbound_slab.capacity() < next_len {
+                self.inbound_slab = BytesMut::with_capacity(INBOUND_SLAB_CAPACITY.max(next_len));
+            }
+            let start = self.inbound_slab.len();
+            self.inbound_slab.resize(start + next_len, 0);
+            match self.conn.dgram_recv(&mut self.inbound_slab[start..start + next_len]) {
+                Ok(n) => {
+                    self.inbound_slab.truncate(start + n);
+                    let dgram = self.inbound_slab.split().freeze();
                     progressed = true;
                     if let Some(offset) = parse_datagram_offset(&dgram, self.flow_id) {
-                        let dgram = Bytes::from(dgram);
                         let packet = dgram.slice(offset..);
                         if packet::validate_incoming(packet.as_ref()).is_ok() {
                             self.inbound_queue.push_back(packet);
                         }
                     }
                 }
-                Err(quiche::Error::Done) => return Ok(progressed),
+                Err(quiche::Error::Done) => {
+                    self.inbound_slab.truncate(start);
+                    return Ok(progressed);
+                }
                 Err(error) => {
+                    self.inbound_slab.truncate(start);
                     log::debug!("dgram recv error: {error}");
                     return Ok(progressed);
                 }
@@ -1323,5 +1583,53 @@ mod tests {
         let remaining: Vec<&[u8]> = queue.iter().map(|(_, p)| p.as_ref()).collect();
         assert_eq!(remaining, vec![b"fresh-2".as_slice(), b"fresh-3".as_slice()]);
         assert_eq!(prune_outbound_queue(&mut queue, now, 2), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recv_slot_stride_avoids_page_multiples() {
+        assert_eq!(recv_slot_stride(2048), 2048);
+        assert_eq!(recv_slot_stride(4096), 4096 + 64);
+        assert_eq!(recv_slot_stride(65536), 65536 + 64);
+        assert_eq!(recv_slot_stride(1500), 1536);
+        assert_eq!(recv_slot_stride(65536) % PAGE_BYTES, CACHE_LINE_BYTES);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn recvmmsg_gro_buf_receives_batch_on_loopback() {
+        let rx = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rx_addr = rx.local_addr().unwrap();
+        let tx = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let gro_enabled = RecvMmsgGroBuf::try_enable_udp_gro(&rx);
+        let mut batch = RecvMmsgGroBuf::new(gro_enabled);
+
+        let payloads: [&[u8]; 3] = [b"pkt-one", b"pkt-two-22", b"pkt-three-333"];
+        for p in payloads {
+            tx.send_to(p, rx_addr).await.unwrap();
+        }
+
+        let mut received = Vec::new();
+        while received.len() < payloads.len() {
+            rx.readable().await.unwrap();
+            if let Some(n) = batch.try_recv_batch(&rx).unwrap() {
+                for i in 0..n {
+                    let (buf, gso_size) = batch.slot_mut(i);
+                    if gso_size > 0 && buf.len() > gso_size {
+                        for chunk in buf.chunks(gso_size) {
+                            received.push(chunk.to_vec());
+                        }
+                    } else {
+                        received.push(buf.to_vec());
+                    }
+                }
+            }
+        }
+
+        assert_eq!(received.len(), payloads.len());
+        for (got, expected) in received.iter().zip(payloads.iter()) {
+            assert_eq!(got.as_slice(), *expected);
+        }
     }
 }
